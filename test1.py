@@ -83,6 +83,12 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
+        # FIX: Enforce that unit_price is numeric (or a numeric string) to prevent
+        # a silent TypeError crash downstream in process_order_calculations.
+        try:
+            float(item["unit_price"])
+        except (ValueError, TypeError):
+            return False, f"Line item at index {idx} has non-numeric unit_price: '{item['unit_price']}'"
             
     return True, None
 
@@ -100,15 +106,22 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # FIX: Explicitly cast unit_price to float to handle both numeric strings
+        # (e.g. '1299.99') and already-numeric values (e.g. 1299.99) arriving
+        # from the JSON payload. A descriptive ValueError is raised for
+        # non-numeric values so failures surface clearly in Lambda logs.
+        try:
+            unit_price = float(item["unit_price"])
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Invalid unit_price '{item['unit_price']}' for SKU '{sku}': must be numeric"
+            ) from e
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
+        # FIX: Store the cast float variable (unit_price) in the breakdown dict,
+        # not item['unit_price'], so the audit output contains a numeric value.
         line_item_breakdowns.append({
             "sku": sku,
             "quantity": qty,
@@ -142,7 +155,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
-    # Self-contained simulated API Gateway event payload
+    # FIX: Changed unit_price values from quoted string literals ("1299.99", "89.50")
+    # to unquoted JSON numeric literals (1299.99, 89.50) so the self-contained
+    # synthetic payload matches the expected contract and does not mask type bugs.
     synthetic_event = {
         "headers": {
             "x-signature": "5d41402abc4b2a76b9719d911017c592",
@@ -154,8 +169,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "billing_region": "US-CA",
             "discount_code": "WELCOME10",
             "line_items": [
-                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": "1299.99"},
-                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": "89.50"}
+                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": 1299.99},
+                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": 89.50}
             ]
         })
     }
