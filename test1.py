@@ -69,6 +69,25 @@ def verify_hmac_signature(secret: str, payload: str, signature: str) -> bool:
     computed = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed, signature)
 
+def _is_numeric_value(value: Any) -> bool:
+    """
+    Returns True if 'value' is a real number, or a string that can be safely
+    parsed into a float (e.g. API Gateway/JSON payloads commonly deliver
+    numeric fields such as unit_price as strings like '149.99').
+    Booleans are explicitly excluded since bool is a subclass of int.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+    return False
+
 def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     required_fields = ["order_id", "customer_id", "billing_region", "line_items"]
     for field in required_fields:
@@ -83,6 +102,8 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
+        if not _is_numeric_value(item["unit_price"]):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']}"
             
     return True, None
 
@@ -100,19 +121,27 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # API ingestion frequently delivers unit_price as a raw string (e.g., "149.99").
+        # Explicitly coerce it to a float before performing any arithmetic so we never
+        # attempt to multiply a str by a float (TypeError: can't multiply sequence by
+        # non-int of type 'float'). Genuinely non-numeric garbage is converted into a
+        # clear ValueError that the caller can translate into a 4xx response instead
+        # of an unhandled Lambda crash.
+        raw_unit_price = item["unit_price"]
+        try:
+            unit_price = float(raw_unit_price)
+        except (TypeError, ValueError) as cast_err:
+            raise ValueError(
+                f"Line item '{sku}' has a non-numeric unit_price: {raw_unit_price!r}"
+            ) from cast_err
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
         line_item_breakdowns.append({
             "sku": sku,
             "quantity": qty,
-            "unit_price": unit_price,
+            "unit_price": round(unit_price, 2),
             "calculated_tax": round(item_tax, 2),
             "extended_price": round(extended_price, 2)
         })
@@ -189,6 +218,32 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except (TypeError, ValueError) as val_exc:
+        # Client-caused failure (e.g. non-numeric unit_price that slipped past
+        # schema validation, or other malformed numeric input). Return a
+        # structured 422 response instead of letting Lambda report an
+        # unhandled function error.
+        logger.error(
+            f"Order calculation rejected due to invalid input: {str(val_exc)}",
+            extra={"custom_dimensions": {"request_id": request_id}}
+        )
+        return {
+            "statusCode": 422,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(val_exc), "request_id": request_id})
+        }
+
     except Exception as exc:
+        # Truly unexpected/server-side failure. Log full details for CloudWatch
+        # diagnostics but return a graceful 500 JSON response rather than an
+        # unhandled Lambda invocation error, so API Gateway callers receive a
+        # consistent structured body.
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Internal server error while processing order",
+                "request_id": request_id
+            })
+        }
