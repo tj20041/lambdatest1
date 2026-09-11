@@ -50,6 +50,45 @@ DISCOUNT_CODES = {
     "FREESHIP": 0.0
 }
 
+
+class OrderValidationError(Exception):
+    """Raised when order payload data fails business/type validation
+    (e.g. a non-numeric unit_price). This is distinct from unexpected
+    runtime exceptions so the Lambda handler can return a clean 4xx
+    response instead of failing the entire invocation."""
+    pass
+
+
+def _coerce_to_float(value: Any, field_name: str) -> float:
+    """Safely coerce a numeric-like value (int, float, or numeric string)
+    into a float. Raises OrderValidationError on any non-numeric input
+    so callers can surface a clean validation error instead of a raw
+    TypeError/ValueError."""
+    if isinstance(value, bool):
+        # bool is technically an int subclass in Python; explicitly reject it
+        raise OrderValidationError(f"Field '{field_name}' must be numeric, got boolean")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (ValueError, AttributeError):
+            raise OrderValidationError(f"Field '{field_name}' has non-numeric value: '{value}'")
+    raise OrderValidationError(f"Field '{field_name}' has unsupported type: {type(value).__name__}")
+
+
+def _is_valid_price(value: Any) -> bool:
+    """Returns True if value is numeric or a numeric-parseable string
+    representing a non-negative price. Used during payload validation
+    to reject malformed line items before they reach the arithmetic
+    engine in process_order_calculations."""
+    try:
+        parsed = _coerce_to_float(value, "unit_price")
+    except OrderValidationError:
+        return False
+    return parsed >= 0
+
+
 class PaymentAuditTracker:
     def __init__(self, trace_id: str):
         self.trace_id = trace_id
@@ -81,8 +120,10 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
     for idx, item in enumerate(payload["line_items"]):
         if not all(k in item for k in ("sku", "quantity", "unit_price")):
             return False, f"Line item at index {idx} violates schema: {item}"
-        if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
+        if not isinstance(item["quantity"], int) or isinstance(item["quantity"], bool) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
+        if not _is_valid_price(item["unit_price"]):
+            return False, f"Line item at index {idx} has invalid or non-numeric unit_price: '{item['unit_price']}'"
             
     return True, None
 
@@ -100,12 +141,11 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # Order payloads commonly arrive from API Gateway with numeric fields
+        # serialized as JSON strings (e.g. "149.99"). Explicitly coerce to
+        # float here so downstream arithmetic never operates on a str.
+        unit_price = _coerce_to_float(item["unit_price"], "unit_price")
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
@@ -142,7 +182,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
-    # Self-contained simulated API Gateway event payload
+    # Self-contained simulated API Gateway event payload.
+    # unit_price is intentionally kept as a JSON string here to mirror the
+    # typical API Gateway payload shape; process_order_calculations now
+    # safely coerces this to a numeric type before performing arithmetic.
     synthetic_event = {
         "headers": {
             "x-signature": "5d41402abc4b2a76b9719d911017c592",
@@ -176,7 +219,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         tracker.record_step("VALIDATION_SUCCESS", {"order_id": parsed_payload["order_id"]})
         
         # Trigger business processing logic
-        pricing_manifest = process_order_calculations(parsed_payload, tracker)
+        try:
+            pricing_manifest = process_order_calculations(parsed_payload, tracker)
+        except OrderValidationError as val_err:
+            # Business/data validation failure (e.g. malformed numeric field
+            # that slipped past validate_order_contract). Return a clean
+            # 422 response instead of failing the entire Lambda invocation.
+            logger.error(f"Order calculation validation failure: {str(val_err)}")
+            return {
+                "statusCode": 422,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": str(val_err),
+                    "request_id": request_id,
+                    "order_id": parsed_payload.get("order_id")
+                })
+            }
 
         return {
             "statusCode": 200,
@@ -189,6 +247,18 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except (TypeError, ValueError, KeyError) as known_exc:
+        # Known, recoverable data-shape issues: log and return a structured
+        # 400 response so API Gateway callers get a well-formed error body
+        # instead of the Lambda invocation itself failing.
+        logger.exception(f"Recoverable data error in order execution pipeline: {str(known_exc)}")
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(known_exc), "request_id": request_id})
+        }
     except Exception as exc:
+        # Truly unexpected exceptions are still logged and re-raised so
+        # Lambda/CloudWatch error metrics and alarms continue to fire.
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
         raise
