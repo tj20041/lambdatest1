@@ -50,6 +50,12 @@ DISCOUNT_CODES = {
     "FREESHIP": 0.0
 }
 
+
+class PricingDataError(Exception):
+    """Raised when order line item pricing data cannot be safely coerced to a numeric type."""
+    pass
+
+
 class PaymentAuditTracker:
     def __init__(self, trace_id: str):
         self.trace_id = trace_id
@@ -65,9 +71,31 @@ class PaymentAuditTracker:
         self.events.append(event)
         logger.info(f"Audit Step Recorded: {stage_name}", extra={"custom_dimensions": event})
 
+
 def verify_hmac_signature(secret: str, payload: str, signature: str) -> bool:
     computed = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed, signature)
+
+
+def _is_numeric_value(value: Any) -> bool:
+    """Return True if value is a numeric type, or a string that can be parsed as a float.
+
+    This guards against malformed/loosely-typed payloads (e.g. non-numeric strings,
+    None, lists, dicts) reaching the arithmetic stage in process_order_calculations().
+    """
+    if isinstance(value, bool):
+        # bool is a subclass of int in Python; explicitly reject to avoid silent True/False pricing.
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+    return False
+
 
 def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     required_fields = ["order_id", "customer_id", "billing_region", "line_items"]
@@ -83,8 +111,11 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
+        if not _is_numeric_value(item["unit_price"]):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']!r}"
             
     return True, None
+
 
 def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAuditTracker) -> Dict[str, Any]:
     region = order_data.get("billing_region", "DEFAULT")
@@ -100,19 +131,24 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # unit_price may arrive as a raw string from API Gateway JSON ingestion (e.g., "149.99").
+        # Explicitly coerce to float before performing any arithmetic to avoid
+        # 'TypeError: can't multiply sequence by non-int of type float'.
+        raw_unit_price = item["unit_price"]
+        try:
+            unit_price = float(raw_unit_price)
+        except (TypeError, ValueError) as coercion_exc:
+            raise PricingDataError(
+                f"Unable to convert unit_price '{raw_unit_price}' to a numeric value for SKU '{sku}'"
+            ) from coercion_exc
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
         line_item_breakdowns.append({
             "sku": sku,
             "quantity": qty,
-            "unit_price": unit_price,
+            "unit_price": round(unit_price, 2),
             "calculated_tax": round(item_tax, 2),
             "extended_price": round(extended_price, 2)
         })
@@ -132,6 +168,7 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     
     tracker.record_step("CALCULATION_COMPLETE", {"grand_total": result["grand_total"]})
     return result
+
 
 # ---------------------------------------------------------------------------
 # Lambda Handler Entrypoint
@@ -189,6 +226,32 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except (PricingDataError, TypeError, ValueError) as data_exc:
+        # Client/data-quality issue (e.g., non-numeric unit_price) -- return a structured
+        # 422 response instead of allowing Lambda to surface an unhandled function error.
+        logger.error(
+            f"Rejected order due to invalid pricing data: {str(data_exc)}",
+            extra={"custom_dimensions": {"request_id": request_id}}
+        )
+        return {
+            "statusCode": 422,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Unprocessable order payload: invalid or non-numeric pricing data",
+                "detail": str(data_exc),
+                "request_id": request_id
+            })
+        }
+
     except Exception as exc:
+        # Truly unexpected server-side error -- log with full traceback and return a
+        # graceful structured 500 response rather than an unhandled Lambda invocation failure.
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Internal server error while processing order",
+                "request_id": request_id
+            })
+        }
