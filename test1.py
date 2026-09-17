@@ -69,6 +69,25 @@ def verify_hmac_signature(secret: str, payload: str, signature: str) -> bool:
     computed = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     return hmac.compare_digest(computed, signature)
 
+def _is_numeric_value(value: Any) -> bool:
+    """
+    Returns True if value is an int/float (excluding bool) or a string that
+    can be safely parsed into a float. Used to validate monetary fields
+    (e.g. unit_price) before they reach arithmetic operations, preventing
+    TypeError from unvalidated string/float multiplication downstream.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        try:
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+    return False
+
 def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     required_fields = ["order_id", "customer_id", "billing_region", "line_items"]
     for field in required_fields:
@@ -83,6 +102,8 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
+        if not _is_numeric_value(item["unit_price"]):
+            return False, f"Line item at index {idx} has invalid unit_price: {item['unit_price']!r}"
             
     return True, None
 
@@ -100,19 +121,24 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # unit_price may arrive as a raw string from API Gateway JSON ingestion
+        # (e.g., "149.99"), so it must be explicitly coerced to a numeric type
+        # before being used in arithmetic against the float tax_multiplier.
+        raw_unit_price = item["unit_price"]
+        try:
+            unit_price = float(raw_unit_price)
+        except (TypeError, ValueError) as cast_exc:
+            raise ValueError(
+                f"Line item '{sku}' has a non-numeric unit_price value: {raw_unit_price!r}"
+            ) from cast_exc
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
         line_item_breakdowns.append({
             "sku": sku,
             "quantity": qty,
-            "unit_price": unit_price,
+            "unit_price": round(unit_price, 2),
             "calculated_tax": round(item_tax, 2),
             "extended_price": round(extended_price, 2)
         })
@@ -176,7 +202,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         tracker.record_step("VALIDATION_SUCCESS", {"order_id": parsed_payload["order_id"]})
         
         # Trigger business processing logic
-        pricing_manifest = process_order_calculations(parsed_payload, tracker)
+        try:
+            pricing_manifest = process_order_calculations(parsed_payload, tracker)
+        except (TypeError, ValueError) as calc_exc:
+            # Client-caused numeric/type issue in the payload that slipped past
+            # validate_order_contract (or a defensive re-check failure). Return
+            # a structured 422 instead of allowing Lambda to fault.
+            logger.error(f"Invalid numeric field in order calculation: {str(calc_exc)}")
+            return {
+                "statusCode": 422,
+                "headers": {"Content-Type": "application/json"},
+                "body": json.dumps({
+                    "error": f"Unable to process order due to invalid numeric field: {str(calc_exc)}",
+                    "request_id": request_id
+                })
+            }
 
         return {
             "statusCode": 200,
@@ -190,5 +230,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     except Exception as exc:
+        # Truly unexpected server-side failure. Log with full traceback and
+        # return a graceful structured 500 JSON body instead of re-raising,
+        # which would otherwise surface as an unhandled Lambda function error.
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Internal server error while processing order",
+                "request_id": request_id
+            })
+        }
