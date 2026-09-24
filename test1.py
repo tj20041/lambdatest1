@@ -74,17 +74,30 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
     for field in required_fields:
         if field not in payload:
             return False, f"Missing required payload attribute: '{field}'"
-    
+
     if not isinstance(payload["line_items"], list) or len(payload["line_items"]) == 0:
         return False, "line_items must be a non-empty list"
-        
+
     for idx, item in enumerate(payload["line_items"]):
         if not all(k in item for k in ("sku", "quantity", "unit_price")):
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
-            
+        # Validate that unit_price is numeric or a string convertible to a positive float
+        try:
+            price_val = float(item["unit_price"])
+            if price_val < 0:
+                return False, f"Line item at index {idx} has negative unit_price"
+        except (TypeError, ValueError):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']!r}"
+
     return True, None
+
+
+class OrderCalculationError(Exception):
+    """Raised when a line item contains a unit_price that cannot be coerced to float."""
+    pass
+
 
 def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAuditTracker) -> Dict[str, Any]:
     region = order_data.get("billing_region", "DEFAULT")
@@ -97,15 +110,19 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     running_subtotal = 0.0
     line_item_breakdowns = []
 
-    for item in order_data["line_items"]:
+    for idx, item in enumerate(order_data["line_items"]):
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # Coerce unit_price to float to handle string values from API ingestion
+        # (e.g. "149.99") as well as already-numeric values.
+        try:
+            unit_price = float(item["unit_price"])
+        except (TypeError, ValueError) as exc:
+            raise OrderCalculationError(
+                f"Line item at index {idx} (sku={sku!r}) has non-numeric unit_price: "
+                f"{item['unit_price']!r}"
+            ) from exc
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
@@ -129,7 +146,7 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
         "grand_total": round(grand_total, 2),
         "items": line_item_breakdowns
     }
-    
+
     tracker.record_step("CALCULATION_COMPLETE", {"grand_total": result["grand_total"]})
     return result
 
@@ -139,7 +156,7 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     request_id = str(uuid.uuid4())
     tracker = PaymentAuditTracker(trace_id=request_id)
-    
+
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
     # Self-contained simulated API Gateway event payload
@@ -163,7 +180,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         body_str = synthetic_event.get("body", "{}")
         parsed_payload = json.loads(body_str)
-        
+
         is_valid, validation_err = validate_order_contract(parsed_payload)
         if not is_valid:
             logger.error(f"Payload validation rejection: {validation_err}")
@@ -174,7 +191,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
 
         tracker.record_step("VALIDATION_SUCCESS", {"order_id": parsed_payload["order_id"]})
-        
+
         # Trigger business processing logic
         pricing_manifest = process_order_calculations(parsed_payload, tracker)
 
@@ -189,6 +206,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except OrderCalculationError as calc_err:
+        # Data-quality error caused by the caller — return a structured 400
+        logger.error(
+            f"Order calculation rejected due to invalid input data: {str(calc_err)}",
+            extra={"custom_dimensions": {"request_id": request_id}}
+        )
+        return {
+            "statusCode": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(calc_err), "request_id": request_id})
+        }
+
     except Exception as exc:
-        logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        # Genuine unexpected server error — log with full traceback and return 500
+        logger.exception(
+            f"Unhandled internal server error in order execution pipeline: {str(exc)}",
+            extra={"custom_dimensions": {"request_id": request_id}}
+        )
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Internal server error",
+                "request_id": request_id
+            })
+        }
