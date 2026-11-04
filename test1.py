@@ -83,7 +83,17 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
-            
+
+        # Enforce numeric contract for unit_price at the input boundary,
+        # consistent with the quantity validation pattern above.
+        try:
+            price_val = float(item["unit_price"])
+        except (ValueError, TypeError):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']!r}"
+
+        if price_val <= 0:
+            return False, f"Line item at index {idx} has non-positive unit_price: {price_val}"
+
     return True, None
 
 def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAuditTracker) -> Dict[str, Any]:
@@ -100,12 +110,15 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # unit_price may arrive as a raw string (e.g., "149.99") from JSON ingestion,
+        # so it must be safely cast to a float before any arithmetic is performed.
+        try:
+            unit_price = float(item["unit_price"])
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Invalid unit_price for SKU {item.get('sku', 'UNKNOWN')}: {item['unit_price']!r}"
+            ) from e
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
         extended_price = unit_price * qty
 
@@ -142,7 +155,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
-    # Self-contained simulated API Gateway event payload
+    # Self-contained simulated API Gateway event payload.
+    # unit_price values are encoded as JSON numbers (not quoted strings) to
+    # match the contract expected by process_order_calculations().
     synthetic_event = {
         "headers": {
             "x-signature": "5d41402abc4b2a76b9719d911017c592",
@@ -154,8 +169,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "billing_region": "US-CA",
             "discount_code": "WELCOME10",
             "line_items": [
-                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": "1299.99"},
-                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": "89.50"}
+                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": 1299.99},
+                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": 89.50}
             ]
         })
     }
@@ -191,4 +206,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     except Exception as exc:
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        # Return a structured error response instead of letting the raw
+        # exception propagate as an unformatted Lambda runtime error envelope.
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "error": "Internal pricing calculation failure",
+                "request_id": request_id
+            })
+        }
