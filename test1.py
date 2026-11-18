@@ -83,7 +83,17 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
-            
+
+        # Enforce that unit_price is numeric and non-negative at the validation
+        # boundary so malformed payloads (e.g. strings, None) are rejected with
+        # a structured 400 response instead of crashing the arithmetic layer.
+        try:
+            price_val = float(item["unit_price"])
+        except (ValueError, TypeError):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']!r}"
+        if price_val < 0:
+            return False, f"Line item at index {idx} has negative unit_price: {price_val}"
+
     return True, None
 
 def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAuditTracker) -> Dict[str, Any]:
@@ -100,14 +110,19 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
     for item in order_data["line_items"]:
         sku = item["sku"]
         qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
+        # unit_price may arrive from API Gateway as a raw JSON string (e.g.,
+        # "149.99") depending on upstream client serialization. Cast it to a
+        # numeric float before performing any arithmetic to avoid TypeError:
+        # "can't multiply sequence by non-int of type 'float'".
+        try:
+            unit_price = float(item["unit_price"])
+        except (ValueError, TypeError) as cast_err:
+            raise ValueError(
+                f"Line item sku={item.get('sku')!r} has non-numeric unit_price: {item['unit_price']!r}"
+            ) from cast_err
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
         item_tax = unit_price * tax_multiplier
-        extended_price = unit_price * qty
+        extended_price = unit_price * int(qty)
 
         line_item_breakdowns.append({
             "sku": sku,
@@ -142,7 +157,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
-    # Self-contained simulated API Gateway event payload
+    # Self-contained simulated API Gateway event payload.
+    # unit_price is encoded as bare JSON numbers (not quoted strings) so this
+    # built-in fixture represents a correctly-typed payload and no longer
+    # guarantees a reproduction of the TypeError defect.
     synthetic_event = {
         "headers": {
             "x-signature": "5d41402abc4b2a76b9719d911017c592",
@@ -154,14 +172,14 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "billing_region": "US-CA",
             "discount_code": "WELCOME10",
             "line_items": [
-                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": "1299.99"},
-                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": "89.50"}
+                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": 1299.99},
+                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": 89.50}
             ]
         })
     }
 
     try:
-        body_str = synthetic_event.get("body", "{}")
+        body_str = event.get("body") if isinstance(event, dict) and event.get("body") else synthetic_event.get("body", "{}")
         parsed_payload = json.loads(body_str)
         
         is_valid, validation_err = validate_order_contract(parsed_payload)
@@ -189,6 +207,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except (ValueError, TypeError) as validation_exc:
+        # Defensive second line of defense: if a numeric coercion error slips
+        # past validate_order_contract() (e.g. future schema changes), return
+        # a structured 422 client error instead of letting Lambda surface an
+        # unhandled runtime exception.
+        logger.error(f"Unprocessable order payload: {str(validation_exc)}", extra={"custom_dimensions": {"request_id": request_id}})
+        return {
+            "statusCode": 422,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(validation_exc), "request_id": request_id})
+        }
+
     except Exception as exc:
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal server error", "request_id": request_id})
+        }
