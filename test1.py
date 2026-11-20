@@ -83,7 +83,17 @@ def validate_order_contract(payload: Dict[str, Any]) -> Tuple[bool, Optional[str
             return False, f"Line item at index {idx} violates schema: {item}"
         if not isinstance(item["quantity"], int) or item["quantity"] <= 0:
             return False, f"Line item at index {idx} has invalid quantity"
-            
+
+        # Enforce that unit_price is numeric (or safely coercible to float) and non-negative.
+        # This closes the gap that previously allowed quoted string prices (e.g. "1299.99")
+        # to pass schema validation and crash the downstream calculation engine.
+        try:
+            price_val = float(item["unit_price"])
+        except (ValueError, TypeError):
+            return False, f"Line item at index {idx} has non-numeric unit_price: {item['unit_price']!r}"
+        if price_val < 0:
+            return False, f"Line item at index {idx} has negative unit_price: {price_val}"
+
     return True, None
 
 def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAuditTracker) -> Dict[str, Any]:
@@ -99,14 +109,25 @@ def process_order_calculations(order_data: Dict[str, Any], tracker: PaymentAudit
 
     for item in order_data["line_items"]:
         sku = item["sku"]
-        qty = item["quantity"]
-        # In typical API ingestion, unit_price might arrive as a raw string (e.g., "149.99")
-        unit_price = item["unit_price"]
 
-        # FAILS HERE: unit_price is string '149.99', tax_multiplier is float 0.0925
-        # Attempting to calculate tax per line item directly without numeric casting
-        # Raises TypeError: can't multiply sequence by non-int of type 'float'
+        # qty is validated as a positive int upstream in validate_order_contract(), but we
+        # defensively cast it here too so extended_price always evaluates as float * int.
+        try:
+            qty = int(item["quantity"])
+        except (ValueError, TypeError):
+            raise ValueError(f"Line item sku={sku!r} has non-integer quantity: {item['quantity']!r}")
+
+        # unit_price may arrive from API ingestion as a raw string (e.g., "149.99").
+        # Cast it to float explicitly so arithmetic below never raises
+        # "TypeError: can't multiply sequence by non-int of type 'float'" and never
+        # silently corrupts extended_price via string repetition (str * int).
+        try:
+            unit_price = float(item["unit_price"])
+        except (ValueError, TypeError):
+            raise ValueError(f"Line item sku={sku!r} has non-numeric unit_price: {item['unit_price']!r}")
+
         item_tax = unit_price * tax_multiplier
+        # qty is guaranteed int here, so this is a safe float * int numeric multiplication.
         extended_price = unit_price * qty
 
         line_item_breakdowns.append({
@@ -142,7 +163,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     
     logger.info("Initializing payment checkout order flow", extra={"custom_dimensions": {"request_id": request_id}})
 
-    # Self-contained simulated API Gateway event payload
+    # Self-contained simulated API Gateway event payload, used only as a local/test fallback
+    # when no real event body is supplied. unit_price values are correctly typed as JSON
+    # numbers (not quoted strings) so this fixture matches the enforced schema contract.
     synthetic_event = {
         "headers": {
             "x-signature": "5d41402abc4b2a76b9719d911017c592",
@@ -154,14 +177,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "billing_region": "US-CA",
             "discount_code": "WELCOME10",
             "line_items": [
-                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": "1299.99"},
-                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": "89.50"}
+                {"sku": "LAPTOP-M3", "quantity": 1, "unit_price": 1299.99},
+                {"sku": "USB-C-DOCK", "quantity": 2, "unit_price": 89.50}
             ]
         })
     }
 
+    # Standard AWS Lambda handler pattern: prefer the real incoming event when present,
+    # and only fall back to the synthetic fixture for local/test invocations where no
+    # body is supplied (e.g. manual console test events with an empty payload).
+    active_event = event if event and event.get("body") else synthetic_event
+
     try:
-        body_str = synthetic_event.get("body", "{}")
+        body_str = active_event.get("body", "{}")
         parsed_payload = json.loads(body_str)
         
         is_valid, validation_err = validate_order_contract(parsed_payload)
@@ -189,6 +217,20 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
         }
 
+    except (ValueError, TypeError) as val_exc:
+        # Defense-in-depth: catches malformed numeric fields (e.g. unit_price/quantity)
+        # that slip past validate_order_contract() due to a future schema change, and
+        # returns a structured 422 response instead of an unhandled Lambda runtime error.
+        logger.exception(f"Unprocessable order payload in order execution pipeline: {str(val_exc)}")
+        return {
+            "statusCode": 422,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": str(val_exc), "request_id": request_id})
+        }
     except Exception as exc:
         logger.exception(f"Unhandled error in order execution pipeline: {str(exc)}")
-        raise
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal error processing order", "request_id": request_id})
+        }
